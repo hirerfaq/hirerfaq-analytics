@@ -8,6 +8,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
 /* === RESET & BASE === */
@@ -268,6 +269,7 @@ td.num,th.num{font-family:'DM Mono',monospace;text-align:right;white-space:nowra
   <div style="color:var(--muted);font-size:11px;font-weight:600;letter-spacing:2.5px;text-transform:uppercase">Analytics Dashboard</div>
   <div class="header-right">
     <span class="file-label" id="fileLabel">No file loaded</span>
+    <span id="syncStatus" style="font-size:11.5px;font-weight:600;padding:4px 10px;border-radius:12px;background:#F3F4F6;color:var(--muted)">⟳ Connecting…</span>
     <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" style="display:none"/>
     <button class="upload-btn" id="uploadBtn" onclick="document.getElementById('fileInput').click()">📂 Upload Spreadsheet</button>
   </div>
@@ -701,27 +703,146 @@ var allRows=[], headers=[], currentPage=1, PAGE_SIZE=50;
 var selectedRep=null;
 var expenseRate=10, commSoftwareRate=12, summCraRate=10, histCraRate=10;
 var dashCardVis={}; // key -> boolean visibility
-var SETTINGS_KEY='hirerfaq_settings';
+// ─── SUPABASE ─────────────────────────────────────
+var SUPA_URL='https://dxqlcycresccpioqvasr.supabase.co';
+var SUPA_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR4cWxjeWNyZXNjY3Bpb3F2YXNyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMzNzU1MjQsImV4cCI6MjA5ODk1MTUyNH0.Fze064OYOWj2IUIM8hc8_x_nA0i0Vszm6LkeDK6sNy4';
+var supabase=null;
+
+function initSupabase(){
+  try{
+    supabase=window.supabase.createClient(SUPA_URL,SUPA_KEY);
+    setSyncStatus('loading');
+    return true;
+  }catch(e){
+    setSyncStatus('error');
+    console.error('Supabase init error:',e);
+    return false;
+  }
+}
+
+function setSyncStatus(state,msg){
+  var el=document.getElementById('syncStatus');
+  if(!el)return;
+  if(state==='ok')     {el.textContent='☁️ Synced';      el.style.background='#D1FAE5';el.style.color='#065F46';}
+  else if(state==='saving') {el.textContent='⟳ Saving…';  el.style.background='#FEF3C7';el.style.color='#92400E';}
+  else if(state==='loading'){el.textContent='⟳ Loading…'; el.style.background='#DBEAFE';el.style.color='#1E40AF';}
+  else if(state==='error')  {el.textContent='⚠️ Offline'; el.style.background='#FEE2E2';el.style.color='#991B1B';}
+  else if(state==='saved')  {el.textContent='✅ Saved';    el.style.background='#D1FAE5';el.style.color='#065F46';
+    setTimeout(function(){setSyncStatus('ok');},2000);}
+}
+
+// ─── SETTINGS (Supabase) ──────────────────────────
+var SETTINGS_KEY='hirerfaq_settings'; // kept for fallback
 function loadSettings(){
+  // Return default immediately — Supabase loads async in initApp()
   try{
     var raw=localStorage.getItem(SETTINGS_KEY);
-    if(raw){
-      var s=JSON.parse(raw);
-      // Merge into defaults so missing keys don't break anything
-      return{
-        reps:   s.reps||[],
-        repConfig: s.repConfig||{},
-        adjustments: s.adjustments||{}
-      };
-    }
+    if(raw) return JSON.parse(raw);
   }catch(e){}
   return{reps:[],repConfig:{},adjustments:{}};
 }
-function persistSettings(){
-  try{ localStorage.setItem(SETTINGS_KEY,JSON.stringify(settings)); }
-  catch(e){ toast('⚠️ Could not save settings to storage.'); }
+async function loadSettingsFromSupabase(){
+  if(!supabase) return;
+  try{
+    setSyncStatus('loading');
+    var res=await supabase.from('settings').select('data').eq('id','main').single();
+    if(res.error) throw res.error;
+    if(res.data&&res.data.data&&Object.keys(res.data.data).length){
+      settings=Object.assign({reps:[],repConfig:{},adjustments:{}},res.data.data);
+      // also cache locally
+      localStorage.setItem(SETTINGS_KEY,JSON.stringify(settings));
+    }
+    setSyncStatus('ok');
+  }catch(e){
+    console.error('Load settings error:',e);
+    setSyncStatus('error');
+  }
+}
+async function persistSettings(){
+  // Always update local cache immediately
+  try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(settings));}catch(e){}
+  if(!supabase){return;}
+  setSyncStatus('saving');
+  try{
+    var res=await supabase.from('settings').upsert({id:'main',data:settings,updated_at:new Date().toISOString()});
+    if(res.error) throw res.error;
+    setSyncStatus('saved');
+  }catch(e){
+    console.error('Persist settings error:',e);
+    setSyncStatus('error');
+    toast('⚠️ Could not sync settings to cloud.');
+  }
 }
 var settings=loadSettings();
+
+// ─── PERIODS (Supabase) ───────────────────────────
+var HIST_KEY='hirerfaq_periods'; // kept for fallback
+function loadPeriods(){
+  // Return local cache — Supabase loads async
+  try{return JSON.parse(localStorage.getItem(HIST_KEY)||'[]');}
+  catch(e){return [];}
+}
+async function loadPeriodsFromSupabase(){
+  if(!supabase) return;
+  try{
+    var res=await supabase.from('periods').select('*').order('saved_at',{ascending:true});
+    if(res.error) throw res.error;
+    var periods=(res.data||[]).map(function(row){
+      var p=row.data||{};
+      p.id=row.id; p.name=row.name; p.savedAt=row.saved_at;
+      return p;
+    });
+    localStorage.setItem(HIST_KEY,JSON.stringify(periods));
+    return periods;
+  }catch(e){
+    console.error('Load periods error:',e);
+    return loadPeriods();
+  }
+}
+async function savePeriods(periods){
+  // Always save locally first
+  try{localStorage.setItem(HIST_KEY,JSON.stringify(periods));}catch(e){}
+  if(!supabase) return;
+  // Sync to Supabase — upsert each period
+  setSyncStatus('saving');
+  try{
+    // Delete removed periods
+    var ids=periods.map(function(p){return p.id;});
+    if(ids.length){
+      await supabase.from('periods').delete().not('id','in','('+ids.join(',')+')');
+    } else {
+      await supabase.from('periods').delete().neq('id',0);
+    }
+    // Upsert all current periods
+    if(periods.length){
+      var rows=periods.map(function(p){
+        return{id:p.id,name:p.name,saved_at:p.savedAt||new Date().toISOString(),data:p};
+      });
+      var res=await supabase.from('periods').upsert(rows);
+      if(res.error) throw res.error;
+    }
+    setSyncStatus('saved');
+  }catch(e){
+    console.error('Save periods error:',e);
+    setSyncStatus('error');
+    toast('⚠️ Could not sync periods to cloud.');
+  }
+}
+
+// ─── INIT APP (load from Supabase then render) ────
+async function initApp(){
+  initSupabase();
+  // Load settings from Supabase
+  await loadSettingsFromSupabase();
+  // Load periods from Supabase and cache
+  var cloudPeriods=await loadPeriodsFromSupabase();
+  if(cloudPeriods) localStorage.setItem(HIST_KEY,JSON.stringify(cloudPeriods));
+  // Now render with fresh data
+  renderRepList();
+  refreshCommFilter();
+  renderHistory();
+  setSyncStatus('ok');
+}
 var dataSort={col:null,dir:1}, summSort={col:null,dir:1}, commSort={col:null,dir:1};
 
 // COLUMNDEFS
@@ -2061,18 +2182,6 @@ function exportCommissionPDF(){var data=buildCommData();if(!data.length){toast('
 function exportOneBridgePDF(){var rc=null;settings.reps.forEach(function(rep){if(rep.toLowerCase().trim()===OB_NAME.toLowerCase().trim())rc=settings.repConfig[rep];});if(!rc){toast('No config.');return;}var base=getActiveRows();var doc=pdfBase();var sy=pdfHdr(doc,'OneBridge Health Commission','Gross - 12% Fee - Data Cost - Billed S/C - Adjustments x Rate');var head=[['Account','Ref Name','Total Sales Profit','12% Fee','Data Cost','Billed S/C','Adjustments','Net Profit','Rate','Commission $']];var body=[];var tG=0,tF=0,tN=0,tC=0;Object.keys(rc).sort().forEach(function(acc){var cfg=rc[acc];if(!cfg.assigned)return;var s=calcSums(base.filter(function(r){return String(fc(r,COLS.account)).trim()===acc;}));var gross=s.addon+s.adj+s.billed,swFee=gross*0.12,adj=getAdjDeduct(acc),net=gross-swFee-s.data-s.billed-adj,rate=num(cfg.rate),comm=net*(rate/100);tG+=gross;tF+=swFee;tN+=net;tC+=comm;body.push([acc,cfg.refName||'',fmt(gross),fmt(swFee),fmt(s.data),fmt(s.billed),adj?fmt(adj):'—',fmt(net),rate+'%',fmt(comm)]);});body.push([{content:'TOTAL',styles:{fontStyle:'bold',fillColor:[38,77,157],textColor:[255,255,255]}},{content:'',styles:{fillColor:[38,77,157]}},{content:fmt(tG),styles:{fontStyle:'bold',fillColor:[38,77,157],textColor:[255,255,255]}},{content:fmt(tF),styles:{fillColor:[38,77,157],textColor:[255,255,255]}},{content:'',styles:{fillColor:[38,77,157]}},{content:'',styles:{fillColor:[38,77,157]}},{content:'',styles:{fillColor:[38,77,157]}},{content:fmt(tN),styles:{fontStyle:'bold',fillColor:[38,77,157],textColor:[255,255,255]}},{content:'',styles:{fillColor:[38,77,157]}},{content:fmt(tC),styles:{fontStyle:'bold',fillColor:[38,77,157],textColor:[255,255,255]}}]);doc.autoTable({head:head,body:body,startY:sy,headStyles:PH,alternateRowStyles:PA,bodyStyles:{fontSize:7.5,textColor:[26,32,69]},margin:{top:sy,bottom:14}});pdfFtr(doc);doc.save('onebridge_commission.pdf');toast('⬇ PDF downloading…');}
 
 // HISTORY
-// Storage key for persisted periods
-var HIST_KEY = 'hirerfaq_periods';
-
-function loadPeriods(){
-  try{ return JSON.parse(localStorage.getItem(HIST_KEY)||'[]'); }
-  catch(e){ return []; }
-}
-function savePeriods(periods){
-  try{ localStorage.setItem(HIST_KEY, JSON.stringify(periods)); }
-  catch(e){ toast('⚠️ Storage full — could not save period.'); }
-}
-
 function enableSavePeriod(){
   var btn=document.getElementById('savePeriodBtn');
   var note=document.getElementById('histSaveNote');
@@ -2452,8 +2561,8 @@ function exportHistoryPDF(){
 
 // INIT
 // Settings already loaded from localStorage via loadSettings() at declaration
-renderRepList();
-refreshCommFilter(); // populate commission rep dropdown from persisted reps
+// Full cloud sync happens in initApp()
+initApp();
 // Set initial tab visibility
 TAB_NAMES.forEach(function(t){
   var el=document.getElementById('tab-'+t);
